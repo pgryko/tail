@@ -26,6 +26,29 @@ Unipart Digital produced a video showing how the system works, and demonstrating
 https://unipart.digital/images/projects/tail/tail-commercial.mp4
 
 
+# Project Structure (This Monorepo)
+
+This repository contains various components related to the Tail system:
+
+*   `/calib`: Calibration tools and scripts for anchors and tags.
+*   `/case`: CAD files for the physical enclosure of devices (likely tags).
+*   `/circuit`: Hardware design files (schematics, PCB layouts) for various versions and test jigs.
+*   `/config`: Configuration files for different deployment scenarios (demo room, HAT EEPROM).
+*   `/demo`: Demonstration code, including anchor/tag simulation and simple RTLS implementations.
+*   `/doc`: Supporting documentation, datasheets, and design notes.
+*   `/firmware`: Source code and build files for the tag firmware (likely running on an EFM32 microcontroller).
+*   `/jig`: Files related to programming/testing jigs.
+*   `/kernel`: Kernel modules (e.g., `ttytail`), possibly for interacting with hardware via specific interfaces.
+*   `/measurement`: Scripts and data related to measurement analysis and positioning algorithms.
+*   `/python`: Core Python libraries and scripts used across different components (e.g., `tail.py`, `dwarf.py`).
+*   `/releases`: Pre-compiled firmware binaries.
+*   `/rtls`: Real-Time Locating System components, including various testing scripts (TWR, TDoA) and analysis tools.
+*   `/scripts`: Utility scripts for system setup, testing, and interaction.
+*   `/tester`: Scripts and configuration for testing hardware components.
+*   `/uwbdump`, `/uwbtest`: Tools for dumping UWB packets and testing UWB functionality.
+*   `/web`: A web interface/dashboard for visualizing system status or tag locations.
+
+
 # Repositories
 
 ## tail

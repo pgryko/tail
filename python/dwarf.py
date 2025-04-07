@@ -1,6 +1,10 @@
 #!/usr/bin/python3
 #
-# dwarf.py	Decawave and RF support library
+# dwarf.py	Decawave (DW1000) and RF support library
+#
+# This module provides constants, conversion functions, calibration data (splines),
+# and utility functions related to the Decawave DW1000 UWB chip and general
+# Radio Frequency (RF) calculations used within the Tail system.
 #
 
 import sys
@@ -8,26 +12,36 @@ import math
 
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-Cabs = 299792458
-Cair = 299705000
+# Physical Constants
+Cabs = 299792458 # Speed of light in vacuum (m/s)
+Cair = 299705000 # Approximate speed of light in air (m/s) - Often approximated by Cabs
+LIGHT_SPEED = Cabs # Use speed of light in vacuum for calculations
 
-LIGHT_SPEED = Cabs
+# DW1000 Specific Constants
+DW1000_CLOCK_GHZ = 63.8976 # DW1000 internal clock frequency in GHz (approx 15.65 ps period)
+DW1000_CLOCK_HZ  = DW1000_CLOCK_GHZ * 1E9 # DW1000 clock frequency in Hz
+DW1000_CLOCK = DW1000_CLOCK_HZ # Alias
 
-DW1000_CLOCK_GHZ = 63.8976
-DW1000_CLOCK_HZ  = DW1000_CLOCK_GHZ * 1E9
-DW1000_CLOCK = DW1000_CLOCK_HZ
+# Default Antenna Delay values (in DW1000 clock ticks) - These are typical starting points
+# and usually require calibration for specific hardware.
+# Calculated as: (Delay_ns * Clock_GHz / 2) - Division by 2 might be specific to implementation?
+DW1000_64PRF_ANTD_NS = 514.4620 # Typical antenna delay in ns for 64 MHz PRF
+DW1000_16PRF_ANTD_NS = 513.9067 # Typical antenna delay in ns for 16 MHz PRF
+DW1000_64PRF_ANTD_DEFAULT = int(DW1000_64PRF_ANTD_NS * DW1000_CLOCK_GHZ / 2) # Default delay for 64 MHz PRF
+DW1000_16PRF_ANTD_DEFAULT = int(DW1000_16PRF_ANTD_NS * DW1000_CLOCK_GHZ / 2) # Default delay for 16 MHz PRF
 
-DW1000_64PRF_ANTD_NS = 514.4620
-DW1000_16PRF_ANTD_NS = 513.9067
-
-DW1000_64PRF_ANTD_DEFAULT = int(DW1000_64PRF_ANTD_NS * DW1000_CLOCK_GHZ / 2)
-DW1000_16PRF_ANTD_DEFAULT = int(DW1000_16PRF_ANTD_NS * DW1000_CLOCK_GHZ / 2)
-
-
-##
-## Splines for RF compensation
-##
+# ---------------------------------------------------------------------------
+# Splines for RF Compensation (Calibration Data)
+# ---------------------------------------------------------------------------
+# These dictionaries contain pre-calculated spline coefficients used to compensate
+# for variations in time-of-flight or distance measurements based on received
+# signal power (dBm). This accounts for non-linearities in the system.
+# Structure: {bandwidth_MHz: {PRF_MHz: ( ((dBm_min, dBm_max), (coeff_a, coeff_b, coeff_c)), ... )}}
+# The function used is likely: compensation = a + b*dBm + c*dBm^2
 
 TIME_COMP_SPLINE = {
     500: {
@@ -127,9 +141,19 @@ RX_BASE_LEVEL = {
 }
 
 
-##
-## Simple spline support
-##
+# Base receive power level (dBm) used as a reference for dBu calculations.
+# These seem specific to the hardware/measurement setup.
+RX_BASE_LEVEL = {
+    16: 113.77, # For 16 MHz PRF
+    64: 121.74, # For 64 MHz PRF
+}
+
+# ---------------------------------------------------------------------------
+# Simple Spline Support Functions
+# ---------------------------------------------------------------------------
+# Note: These functions seem specific to generating the spline data above,
+# likely using linear algebra (least squares fit) on experimental data.
+# They are probably not used during normal operation, only for calibration.
 
 def GenTailSpline(X,Y,borders,ranges,W0=1000,W1=1000):
     NC = 3      # Order, hardcoded
@@ -178,37 +202,64 @@ def GenTailSpline(X,Y,borders,ranges,W0=1000,W1=1000):
     SPL = [[[X[borders[j]],X[borders[j+1]]], [SP[j*NC+i][0] for i in range(NC)]] for j in range(NR)]
     return SPL
 
-
 def TailSpline(spline,X):
+    """
+    Evaluates a quadratic spline at a given point X.
+    Finds the correct segment based on X and applies the quadratic formula.
+
+    Args:
+        spline (tuple): The spline data structure (e.g., TIME_COMP_SPLINE[bw][prf]).
+        X (float): The input value (e.g., dBm) at which to evaluate the spline.
+
+    Returns:
+        float: The calculated spline value (compensation).
+
+    Raises:
+        ValueError: If X is outside the defined range of the spline.
+    """
     for S in spline:
         if S[0][0] < X <= S[0][1]:
             return (S[1][0] + S[1][1]*X + S[1][2]*X*X)
     raise ValueError('Spline X value {} out of range'.format(X))
 
-
-##
-## Decawave power conversion
-##
-
+# ---------------------------------------------------------------------------
+# Decawave Power Conversion Functions
+# ---------------------------------------------------------------------------
+# Functions to convert between different power representations used with DW1000:
+# - Raw power value (internal units, likely related to accumulator counts)
+# - dBu (dB relative to 1 microvolt - often used in RF measurements)
+# - dBm (dB relative to 1 milliwatt - standard RF power unit)
 def RxdBu2Power(dBu, prf=64):
+    """Converts received signal level from dBu to raw power units."""
+    # Note: The formula seems unusual. Typically power ~ 10^(dB/10).
+    # The RX_BASE_LEVEL acts as an offset specific to this system.
     power = math.pow(10, (dBu + RX_BASE_LEVEL[prf])/10)
     return power
 
 def RxPower2dBu(power, prf=64):
+    """Converts raw power units to dBu."""
     dBu = 10*math.log10(power) - RX_BASE_LEVEL[prf]
     return dBu
 
 def RxPower2dBm(power, prf=64):
+    """
+    Converts raw power units to dBm using a spline for calibration.
+    First converts power to dBu, then uses the RX_LEVEL_SPLINE.
+    """
     dBu = RxPower2dBu(power,prf)
-    dBm = TailSpline(RX_LEVEL_SPLINE[prf], dBu + 105) - 105
+    dBm = TailSpline(RX_LEVEL_SPLINE[prf], dBu + 105) - 105 # The +105/-105 suggests the spline might be defined relative to dBm+105?
     return dBm
 
-
-##
-## Time / distance compensation
-##
-
+# ---------------------------------------------------------------------------
+# Time / Distance Compensation Functions (using Splines)
+# ---------------------------------------------------------------------------
+# These functions apply the pre-calculated spline compensations based on
+# received power (dBm), channel, and PRF.
 def dBm2TimeComp(dBm, ch=5, prf=64):
+    """
+    Calculates time compensation (in DW1000 clock ticks) based on dBm, channel, and PRF.
+    Uses the TIME_COMP_SPLINE data.
+    """
     if ch in (4,7):
         bw = 900
     else:
@@ -217,6 +268,10 @@ def dBm2TimeComp(dBm, ch=5, prf=64):
     return clocks
 
 def dBm2DistComp(dBm, ch=5, prf=64):
+    """
+    Calculates distance compensation (units unclear, possibly mm or similar scale?)
+    based on dBm, channel, and PRF. Uses the DIST_COMP_SPLINE data.
+    """
     if ch in (4,7):
         bw = 900
     else:
@@ -224,42 +279,63 @@ def dBm2DistComp(dBm, ch=5, prf=64):
     dist = TailSpline(DIST_COMP_SPLINE[bw][prf],dBm)
     return dist
 
-
-##
-## RF propagation model
-##
-
+# ---------------------------------------------------------------------------
+# RF Propagation Model (Friis Transmission Equation based)
+# ---------------------------------------------------------------------------
+# Functions for estimating signal attenuation based on distance and frequency,
+# and vice-versa. Assumes free-space path loss.
+# Constant part of the Friis path loss formula (4*pi / c)
 _UWB_CC = 4*math.pi/Cabs
 
-_UWB_CH = ( None, 3494.4, 3993.6, 4492.8, 3993.6, 6489.6, None, 6489.6 )
+# Center frequencies (in MHz) for UWB channels used by DW1000
+_UWB_CH = ( None, 3494.4, 3993.6, 4492.8, 3993.6, 6489.6, None, 6489.6 ) # Channels 1, 2, 3, 4, 5, 7
 
 def RFDist2Attn(m,MHz):
+    """Calculates free-space path loss (attenuation) in dB for a given distance and frequency."""
     return 20*np.log10(m*_UWB_CC*MHz*1e6)
 
 def RFAttn2Dist(dBm,MHz):
+    """Calculates distance in meters based on path loss (attenuation dB) and frequency."""
     return (10**(dBm/20))/(_UWB_CC*MHz*1e6)
 
 def RFCalcTxPower(ch,dist,rxlevel):
+    """Estimates required transmit power (dBm) to achieve a given receive level (dBm) at a distance."""
     return rxlevel + RFDist2Attn(dist,_UWB_CH[ch])
 
 def RFCalcRxPower(ch,dist,txlevel):
+    """Estimates received power (dBm) given transmit power (dBm) and distance."""
     return txlevel - RFDist2Attn(dist,_UWB_CH[ch])
 
 def RFCalcDist(ch,txlevel,rxlevel):
+    """Estimates distance (meters) based on transmit and receive power levels (dBm)."""
     return RFAttn2Dist(txlevel-rxlevel, _UWB_CH[ch])
 
-
-
-##
-## Simple peak detection
-##
-
+# ---------------------------------------------------------------------------
+# Simple Peak Detection (for analyzing delay distributions)
+# ---------------------------------------------------------------------------
 def frange(start,stop,step):
+    """Generates a range of floats similar to numpy.arange but potentially simpler."""
+    # Note: np.arange might be more standard/robust here.
     N = int((stop-start)/step)
     R = np.linspace(start,stop,N+1)
     return R
 
 def fpeak(delays, drange=5.0, dwin=0.25, threshold=0.75 ):
+    """
+    Performs simple peak detection on a list of delay values.
+    It creates a histogram-like count within sliding windows and finds the
+    window with the highest count exceeding a threshold, then calculates
+    the mean and standard deviation of the data within that peak window.
+
+    Args:
+        delays (list or np.array): List of delay measurements.
+        drange (float): Range around the mean (in std deviations) to consider.
+        dwin (float): Window size (in std deviations) for counting points.
+        threshold (float): Fraction of the maximum peak count required to identify the peak.
+
+    Returns:
+        tuple: (peak_mean, peak_std_deviation) of the delays within the detected peak window.
+    """
     Data = np.array(delays)
     Davg = np.mean(Data)
     Dstd = np.std(Data)
@@ -285,4 +361,3 @@ def fpeak(delays, drange=5.0, dwin=0.25, threshold=0.75 ):
     Wavg = np.mean(Wdat)
     Wstd = np.std(Wdat)
     return (Wavg,Wstd)
-

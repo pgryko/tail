@@ -2,6 +2,12 @@
 #
 # tail.py	Tail python library
 #
+# This module provides core functionalities for the Tail UWB positioning system.
+# It includes classes for network communication (TailPipe), interaction with
+# DW1000 hardware via sysfs, definitions for timestamp structures, and classes
+# for encoding/decoding IEEE 802.15.4 WPAN frames and the specific Tail protocol
+# frames built upon them.
+#
 
 import os
 import sys
@@ -16,96 +22,147 @@ import traceback
 from ctypes import *
 
 
-##
-## Simple error prints
-##
-
+# ---------------------------------------------------------------------------
+# Simple error printing helpers
+# ---------------------------------------------------------------------------
 def prints(*args, **kwargs):
+    """Prints to stdout without a newline and flushes."""
     print(*args, end='', flush=True, **kwargs)
 
 def eprint(*args, **kwargs):
+    """Prints to stderr."""
     print(*args, file=sys.stderr, **kwargs)
 
 def eprints(*args, **kwargs):
+    """Prints to stderr without a newline and flushes."""
     print(*args, file=sys.stderr, end='', flush=True, **kwargs)
 
 def errhandler(msg,err):
+    """Prints an exception message and traceback to stderr."""
     eprint('\n*** EXCEPTION {}:\n{}***\n'.format(msg,traceback.format_exc()))
 
 
 
-##
-## Network pipe for transferring json messages
-##
-
+# ---------------------------------------------------------------------------
+# Network pipe for transferring messages (typically JSON)
+# ---------------------------------------------------------------------------
 class TailPipe:
-
+    """
+    Base class for network communication pipes used in the Tail system.
+    Provides a common interface for sending and receiving messages.
+    Subclasses implement specific transport protocols (TCP, UDP).
+    """
     def __init__(self,sock=None):
+        """
+        Initializes the TailPipe.
+
+        Args:
+            sock: An optional existing socket object to use. If None, subclasses
+                  will typically create a new socket.
+        """
         self.sock = sock
         self.local = None
         self.remote = None
 
     def fileno(self):
+        """Returns the file descriptor of the underlying socket."""
         if self.sock is not None:
             return self.sock.fileno()
         return None
 
     def close(self):
+        """Closes the underlying socket."""
         if self.sock is not None:
             self.sock.close()
             self.sock = None
 
-    def getsaddr(host,port,sock):
+    @staticmethod
+    def getsaddr(host, port, sock_type):
+        """
+        Resolves host and port to a socket address structure suitable for connect/bind.
+        Prioritizes IPv6 if available for the given socket type.
+
+        Args:
+            host (str): The hostname or IP address.
+            port (int): The port number.
+            sock_type: The socket type (e.g., socket.SOCK_STREAM, socket.SOCK_DGRAM).
+
+        Returns:
+            The socket address tuple (e.g., ('::1', 1234, 0, 0) for IPv6, ('127.0.0.1', 1234) for IPv4)
+            or None if resolution fails.
+        """
         addrs = socket.getaddrinfo(host, port)
+        # Prefer IPv6
         for addr in addrs:
-            if addr[1] == sock:
-                if addr[0] == socket.AF_INET6:
-                    return addr[4]
+            if addr[1] == sock_type and addr[0] == socket.AF_INET6:
+                return addr[4]
+        # Fallback to IPv4
         for addr in addrs:
-            if addr[1] == sock:
+            if addr[1] == sock_type and addr[0] == socket.AF_INET:
                 if addr[0] == socket.AF_INET:
                     return addr[4]
         return None
 
-
+# ---------------------------------------------------------------------------
+# TCP Implementation of TailPipe
+# ---------------------------------------------------------------------------
 class TCPTailPipe(TailPipe):
-
+    """
+    TCP implementation of the TailPipe. Handles message framing using a
+    delimiter (ASCII unit separator, 0x1f). Assumes IPv6 by default.
+    """
     def __init__(self,sock=None):
+        """
+        Initializes the TCPTailPipe. Creates a new IPv6 TCP socket if none is provided.
+        Sets SO_REUSEADDR and TCP_NODELAY options.
+        """
         TailPipe.__init__(self,sock)
         if self.sock is None:
             self.sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.buff = b''
-        
+        self.buff = b'' # Internal buffer for received data
+
+    @staticmethod
     def getsaddr(host,port):
+        """Resolves host/port to a TCP socket address (IPv6 preferred)."""
         return TailPipe.getsaddr(host,port,socket.SOCK_STREAM)
-    
+
     def close(self):
+        """Closes the TCP socket and clears the buffer."""
         TailPipe.close(self)
         self.clear()
 
     def clear(self):
+        """Clears the internal receive buffer."""
         self.buff = b''
 
     def recvraw(self):
+        """Receives raw data from the socket (up to 4096 bytes)."""
         data = self.sock.recv(4096)
         if len(data) < 1:
             raise ConnectionResetError
         return data
 
     def fillbuf(self):
+        """Reads data from the socket and appends it to the internal buffer."""
         self.buff += self.recvraw()
 
     def stripbuf(self):
+        """Removes leading delimiters (0x1f) from the buffer."""
         while len(self.buff) > 0 and self.buff[0] == 31:
-            self.buff = self.buff[1:]
-    
+            self.buff = self.buff[1:] # Indent this line
+
     def hasmsg(self):
+        """Checks if a complete message (ending with 0x1f) is in the buffer."""
         self.stripbuf()
         return (self.buff.find(31) > 0)
 
     def getmsg(self):
+        """
+        Extracts and returns the next complete message from the buffer if available.
+        Returns None otherwise.
+        """
         self.stripbuf()
         eom = self.buff.find(31)
         if eom > 0:
@@ -115,147 +172,199 @@ class TCPTailPipe(TailPipe):
         return None
 
     def getmsgfrom(self):
+        """Gets the next message and the remote address (for consistency with UDP)."""
         return (self.getmsg(),self.remote)
-    
+
     def recvmsg(self):
+        """Blocks until a complete message is received and returns it."""
         while not self.hasmsg():
             self.fillbuf()
         return self.getmsg()
 
     def recvmsgfrom(self):
+        """Blocks until a complete message is received and returns it with the remote address."""
         return (self.recvmsg(),self.remote)
 
     def sendraw(self,data):
+        """Sends raw bytes over the socket."""
         self.sock.sendall(data)
 
     def sendmsg(self,data):
+        """Encodes a string message, appends the delimiter, and sends it."""
         self.sendraw(data.encode() + b'\x1f')
 
     def sendmsgto(self,data,addr):
+        """Not applicable for TCP (use sendmsg). Raises TypeError."""
         raise TypeError
 
     def connect(self, host, port):
+        """Connects the socket to the specified host and port."""
         self.remote = TCPTailPipe.getsaddr(host,port)
         self.sock.connect(self.remote)
 
     def bind(self,addr,port):
+        """Not typically used for client TCP sockets. Raises TypeError."""
         raise TypeError
 
     def listen(self,addr,port):
+        """Binds the socket to a local address/port and listens for incoming connections."""
         self.local = (addr,port)
         self.sock.bind(self.local)
         self.sock.listen()
-    
+
     def accept(self):
+        """
+        Accepts an incoming connection.
+
+        Returns:
+            A new TCPTailPipe instance representing the connection to the client.
+        """
         (csock,caddr) = self.sock.accept()
         pipe = TCPTailPipe(csock)
         pipe.local = self.local
         pipe.remote = caddr
         return pipe
 
-        
+# ---------------------------------------------------------------------------
+# UDP Implementation of TailPipe
+# ---------------------------------------------------------------------------
 class UDPTailPipe(TailPipe):
-
+    """
+    UDP implementation of the TailPipe. Messages are datagrams.
+    Assumes IPv6 by default.
+    """
     def __init__(self,sock=None):
+        """
+        Initializes the UDPTailPipe. Creates a new IPv6 UDP socket if none is provided.
+        Sets SO_REUSEADDR option.
+        """
         TailPipe.__init__(self,sock)
         if self.sock is None:
             self.sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.buff = []
+        self.buff = [] # Buffer for received (datagram, address) tuples
 
+    @staticmethod
     def getsaddr(host,port):
+        """Resolves host/port to a UDP socket address (IPv6 preferred)."""
         return TailPipe.getsaddr(host,port,socket.SOCK_DGRAM)
-    
+
+    @staticmethod
     def clone(parent):
+        """Creates a new UDPTailPipe sharing the same socket as the parent."""
         pipe = UDPTailPipe(parent.sock)
         pipe.local = parent.local
         pipe.remote = parent.remote
         return pipe
-    
+
     def close(self):
+        """Closes the UDP socket and clears the buffer."""
         TailPipe.close(self)
         self.clear()
 
     def clear(self):
+        """Clears the internal receive buffer."""
         self.buff = []
 
     def recvraw(self):
+        """Receives a raw datagram and the sender's address."""
         (data,addr) = self.sock.recvfrom(4096)
         if len(data) < 1:
             raise ConnectionResetError
         return (data,addr)
 
     def fillbuf(self):
+        """Receives one datagram and appends (data, addr) to the buffer."""
         self.buff.append(self.recvraw())
 
     def hasmsg(self):
+        """Checks if there are any received datagrams in the buffer."""
         return bool(self.buff)
 
     def getmsg(self):
+        """
+        Retrieves the next datagram data from the buffer if available.
+        Returns None otherwise.
+        """
         if self.hasmsg():
             (data,addr) = self.buff.pop(0)
             return data.decode()
         return None
-    
+
     def getmsgfrom(self):
+        """
+        Retrieves the next datagram data and sender address from the buffer.
+        Returns None if the buffer is empty.
+        """
         if self.hasmsg():
             (data,addr) = self.buff.pop(0)
             return (data.decode(),addr)
         return None
-    
+
     def recvmsg(self):
+        """Blocks until a datagram is received and returns its data."""
         while not self.hasmsg():
             self.fillbuf()
         return self.getmsg()
 
     def recvmsgfrom(self):
+        """Blocks until a datagram is received and returns its data and sender address."""
         while not self.hasmsg():
             self.fillbuf()
         return self.getmsgfrom()
 
     def sendmsg(self,data):
+        """Encodes and sends a string message to the default remote address."""
         self.sock.sendto(data.encode(),self.remote)
 
     def sendmsgto(self,data,addr):
+        """Encodes and sends a string message to the specified address."""
         self.sock.sendto(data.encode(),addr)
 
     def connect(self,host,port):
+        """Sets the default remote address for sendmsg(). Does not actually connect."""
         self.remote = UDPTailPipe.getsaddr(host,port)
 
     def bind(self,addr,port):
+        """Binds the socket to a local address and port."""
         self.local = (addr,port)
         self.sock.bind(self.local)
 
     def listen(self,addr,port):
+        """Alias for bind() for UDP sockets."""
         self.bind(addr,port)
 
     def accept(self):
+        """Not applicable for UDP. Raises TypeError."""
         raise TypeError
     
 
 
-##
-## DW1000 attributes
-##
-
+# ---------------------------------------------------------------------------
+# DW1000 Hardware Interaction (via sysfs and Device Tree)
+# ---------------------------------------------------------------------------
+# Path to the DW1000 sysfs attributes directory (specific to the hardware setup, likely Raspberry Pi)
 DW1000_SYSFS = '/sys/devices/platform/soc/3f204000.spi/spi_master/spi0/spi0.0/dw1000/'
 
 def SetDWAttr(attr, data):
+    """Sets a DW1000 attribute via its sysfs file."""
     if os.path.isfile(DW1000_SYSFS + attr):
         with open(DW1000_SYSFS + attr, 'w') as f:
             f.write(str(data))
 
 def GetDWAttr(attr):
+    """Gets a DW1000 attribute value from its sysfs file."""
     if os.path.isfile(DW1000_SYSFS + attr):
         with open(DW1000_SYSFS + attr, 'r') as f:
             value = f.read()
         return value.rstrip()
     return None
 
-
+# Path to the DW1000 device tree node attributes in sysfs
 DW1000_SYSDT = '/sys/devices/platform/soc/3f204000.spi/spi_master/spi0/spi0.0/of_node/'
 
 def GetDTAttrRaw(attr):
+    """Reads a raw byte value from a device tree attribute file."""
     if os.path.isfile(DW1000_SYSDT + attr):
         with open(DW1000_SYSDT + attr, 'rb') as f:
             data = f.read()
@@ -263,6 +372,7 @@ def GetDTAttrRaw(attr):
     return None
 
 def GetDTAttrStr(attr):
+    """Reads a string value from a device tree attribute file, stripping trailing nulls/whitespace."""
     if os.path.isfile(DW1000_SYSDT + attr):
         with open(DW1000_SYSDT + attr, 'r') as f:
             data = f.read()
@@ -270,6 +380,7 @@ def GetDTAttrStr(attr):
     return None
 
 def GetDTAttr(attr, form):
+    """Reads a binary value from a device tree attribute file and unpacks it using a struct format."""
     if os.path.isfile(DW1000_SYSDT + attr):
         with open(DW1000_SYSDT + attr, 'rb') as f:
             data = f.read()
@@ -277,30 +388,35 @@ def GetDTAttr(attr, form):
     return []
 
 
-##
-## Pretty printing key/value pairs
-##
-
+# ---------------------------------------------------------------------------
+# Pretty printing helpers
+# ---------------------------------------------------------------------------
+# Default key length for formatted attribute printing
 ATTR_KEY_LEN = 24
 
 def fattr(key,val,ind=0,col=ATTR_KEY_LEN):
+    """Formats a key-value pair with indentation and alignment."""
     return ind*' ' + key.ljust(col-ind) + ': ' + str(val).replace('\n', '\n'+ind*' ').replace(ind*' '+':',':')
 
 def fattrnl(key,val,ind=0,col=ATTR_KEY_LEN):
+    """Formats a key-value pair like fattr() and adds a newline."""
     return fattr(key,val,ind,col) + '\n'
 
 def fnlattr(key,val,ind=0,col=ATTR_KEY_LEN):
+    """Adds a newline before formatting a key-value pair like fattr()."""
     return '\n' + fattr(key,val,ind,col)
 
-
-##
-## Kernel interface data structures
-##
-
+# ---------------------------------------------------------------------------
+# Kernel Interface Data Structures (using ctypes)
+# ---------------------------------------------------------------------------
 class Timespec(Structure):
-
-    _fields_ = [("tv_sec", c_long),
-                ("tv_nsec", c_long)]
+    """
+    Represents the standard C timespec structure (seconds and nanoseconds).
+    Used for software and legacy hardware timestamps.
+    """
+    _fields_ = [("tv_sec", c_long),  # Seconds
+                ("tv_nsec", c_long)] # Nanoseconds
+    # Removed duplicate ("tv_nsec", c_long) line above
 
     def __iter__(self):
         return ((x[0], getattr(self,x[0])) for x in self._fields_)
@@ -315,15 +431,19 @@ class Timespec(Structure):
         return '0x{:x}'.format(int(self))
 
     def __bool__(self):
+        """Returns True if the timestamp is non-zero."""
         return bool(self.tv_sec or self.tv_nsec)
 
-
 class Timehires(Structure):
-
+    """
+    Represents a high-resolution timestamp format, likely specific to the
+    DW1000 or associated hardware/driver. It seems to store nanoseconds
+    and fractional nanoseconds (1/2^32 parts).
+    """
     _fields_ = [
-        ("tv_nsec", c_uint64),
-        ("tv_frac", c_uint32),
-        ("__res", c_uint32) ]
+        ("tv_nsec", c_uint64), # Integer nanoseconds part
+        ("tv_frac", c_uint32), # Fractional nanoseconds part (units of 2^-32 ns)
+        ("__res", c_uint32) ]  # Reserved/padding
 
     def __iter__(self):
         return ((x[0], getattr(self,x[0])) for x in self._fields_)
@@ -338,28 +458,31 @@ class Timehires(Structure):
         return '0x{:x}.{:08x}'.format(self.tv_nsec,self.tv_frac)
 
     def __bool__(self):
+        """Returns True if the high-resolution timestamp is non-zero."""
         return bool(self.tv_nsec or self.tv_frac)
 
-
 class TimestampInfo(Structure):
-
+    """
+    Detailed information associated with a hardware timestamp, likely from
+    the DW1000 receiver, providing quality metrics and diagnostic data.
+    """
     _fields_ = [
-        ("rawts", c_uint64),
-        ("lqi", c_uint16),
-        ("snr", c_uint16),
-        ("fpr", c_uint16),
-        ("noise", c_uint16),
-        ("rxpacc", c_uint16),
-        ("fp_index", c_uint16),
-        ("fp_ampl1", c_uint16),
-        ("fp_ampl2", c_uint16),
-        ("fp_ampl3", c_uint16),
-        ("cir_pwr", c_uint32),
-        ("fp_pwr", c_uint32),
-        ("ttcko", c_uint32),
-        ("ttcki", c_uint32),
-        ("temp", c_int16),
-        ("volt", c_int16),
+        ("rawts", c_uint64),    # Raw hardware timestamp counter value
+        ("lqi", c_uint16),      # Link Quality Indicator
+        ("snr", c_uint16),      # Signal-to-Noise Ratio
+        ("fpr", c_uint16),      # First Path Rate? (Interpretation uncertain)
+        ("noise", c_uint16),    # Noise level measurement
+        ("rxpacc", c_uint16),   # RX Preamble Accumulation Count
+        ("fp_index", c_uint16), # First Path Index (in CIR)
+        ("fp_ampl1", c_uint16), # First Path Amplitude 1
+        ("fp_ampl2", c_uint16), # First Path Amplitude 2
+        ("fp_ampl3", c_uint16), # First Path Amplitude 3
+        ("cir_pwr", c_uint32),  # Channel Impulse Response Power
+        ("fp_pwr", c_uint32),   # First Path Power
+        ("ttcko", c_uint32),    # Crystal Oscillator Trim (TX?)
+        ("ttcki", c_uint32),    # Crystal Oscillator Trim (RX?)
+        ("temp", c_int16),      # Temperature reading (device internal)
+        ("volt", c_int16),      # Voltage reading (device internal)
     ]
 
     def __iter__(self):
@@ -371,15 +494,18 @@ class TimestampInfo(Structure):
             ret += fnlattr(key,val, 2)
         return ret
 
-
 class Timestamp(Structure):
-
+    """
+    Comprehensive timestamp structure, combining software (kernel), legacy hardware,
+    standard hardware (timespec), high-resolution hardware, and detailed info.
+    Likely obtained via socket timestamping options (SO_TIMESTAMPING).
+    """
     _fields_ = [
-        ("sw", Timespec),
-        ("legacy", Timespec),
-        ("hw", Timespec),
-        ("hires", Timehires),
-        ("tsinfo", TimestampInfo),
+        ("sw", Timespec),           # Software timestamp (kernel)
+        ("legacy", Timespec),       # Legacy hardware timestamp (if supported)
+        ("hw", Timespec),           # Hardware timestamp (converted to timespec)
+        ("hires", Timehires),       # High-resolution hardware timestamp
+        ("tsinfo", TimestampInfo),  # Detailed timestamp info from hardware
     ]
 
     def __iter__(self):
@@ -394,45 +520,63 @@ class Timestamp(Structure):
         return ret
 
 
-##
-## Support functions
-##
-
+# ---------------------------------------------------------------------------
+# General Support Functions
+# ---------------------------------------------------------------------------
 def byteswap(data):
+    """Reverses the byte order of a bytes object (e.g., for endianness conversion)."""
     return bytes(reversed(tuple(data)))
 
 def bit(pos):
+    """Returns an integer with the bit at the given position set (e.g., bit(3) -> 8)."""
     return (1<<pos)
 
 def testbit(data,pos):
+    """Tests if a specific bit is set in an integer."""
     return bool(data & bit(pos))
 
 def getbits(data,pos,cnt):
+    """Extracts a specified number of bits starting from a given position in an integer."""
     return (data>>pos) & ((1<<cnt)-1)
 
 def makebits(data,pos,cnt):
+    """Creates an integer by placing the lower 'cnt' bits of 'data' at 'pos'."""
     return (data & ((1<<cnt)-1)) << pos
 
 
 
-##
-## 802.15.4 Frame Format
-##
-
+# ---------------------------------------------------------------------------
+# IEEE 802.15.4 Frame Format Handling
+# ---------------------------------------------------------------------------
 class WPANFrame:
-
+    """
+    Represents and handles encoding/decoding of basic IEEE 802.15.4 WPAN frames.
+    Supports short (16-bit) and extended (64-bit EUI) addresses.
+    """
+    # Data Sequence Number (DSN) - automatically incremented for new frames
     DSN = 0
-    
-    ADDR_NONE  = 0
-    ADDR_SHORT = 2
-    ADDR_EUI64 = 3
 
-    if_addr    = None
-    if_short   = None
+    # Address Modes Constants
+    ADDR_NONE  = 0 # No address present
+    ADDR_SHORT = 2 # 16-bit short address
+    ADDR_EUI64 = 3 # 64-bit extended address (EUI-64)
 
+    # Class variables to store the interface's own addresses (set via set_ifaddr)
+    if_addr    = None # Interface EUI-64 address
+    if_short   = None # Interface short address
+
+    # Verbosity level for __str__ output
     verbosity  = 0
-    
+
     def __init__(self, data=None, ancl=None):
+        """
+        Initializes a WPANFrame instance.
+
+        Args:
+            data (bytes, optional): Raw frame data to decode immediately. Defaults to None.
+            ancl (list, optional): Ancillary data (e.g., from recvmsg) containing
+                                   timestamp information. Defaults to None.
+        """
         self.timestamp      = None
         self.frame          = None
         self.frame_len      = 0
@@ -452,47 +596,67 @@ class WPANFrame:
         
         self.src_mode       = 0
         self.src_addr       = None
-        self.src_panid      = 0xffff
+        self.src_panid      = 0xffff # Source PAN ID
 
         if data is not None:
             self.decode(data)
         if ancl is not None:
             self.decode_ancl(ancl)
 
+    @staticmethod
     def set_ifaddr(if_addr=None, if_short=None):
+        """Sets the EUI-64 and short addresses for the local interface."""
         WPANFrame.if_addr  = if_addr
         WPANFrame.if_short = if_short
 
+    @staticmethod
     def match_if(addr):
+        """Checks if the given address matches the local interface address (short or EUI)."""
         return (addr == WPANFrame.if_addr) or (addr == WPANFrame.if_short)
 
+    @staticmethod
     def match_bcast(addr):
+        """Checks if the given address is a broadcast address (short or EUI)."""
         return (addr == 2 * b'\xff') or (addr == 8 * b'\xff')
-    
+
+    @staticmethod
     def match_local(addr):
+        """Checks if the given address matches the local interface or is broadcast."""
         return WPANFrame.match_if(addr) or WPANFrame.match_bcast(addr)
 
+    @staticmethod
     def is_eui(addr):
+        """Checks if the given address is a valid EUI-64 address (bytes, 8 long, not broadcast)."""
         return (type(addr) is bytes) and (len(addr) == 8) and (addr != 8 * b'\xff')
-        
+
     def get_src_eui(self):
+        """Returns the source EUI-64 address as a hex string, or None if not present/EUI64."""
         if self.src_mode == WPANFrame.ADDR_EUI64:
             return self.src_addr.hex()
         return None
-            
+
     def get_dst_eui(self):
+        """Returns the destination EUI-64 address as a hex string, or None if not present/EUI64."""
         if self.dst_mode == WPANFrame.ADDR_EUI64:
             return self.dst_addr.hex()
         return None
 
     def get_peer_eui(self):
+        """
+        Attempts to identify the EUI-64 of the peer (non-local, non-broadcast) node.
+        Returns the peer EUI-64 as hex string, or None if not applicable/found.
+        """
         if WPANFrame.match_local(self.dst_addr) and WPANFrame.is_eui(self.src_addr):
             return self.src_addr.hex()
         if WPANFrame.match_local(self.src_addr) and WPANFrame.is_eui(self.dst_addr):
             return self.dst_addr.hex()
         return None
-            
+
     def set_src_addr(self,addr):
+        """
+        Sets the source address and mode based on the input type.
+        Accepts None, int (short), bytes (short/EUI64), or hex string (short/EUI64).
+        """
         if addr is None:
             self.src_mode = WPANFrame.ADDR_NONE
             self.src_addr = None
@@ -519,16 +683,21 @@ class WPANFrame:
                 raise ValueError
         else:
             raise ValueError
-            
+
     def set_src_panid(self,panid):
+        """Sets the source PAN ID. Accepts int or 2-byte bytes."""
         if type(panid) is int:
             self.src_panid = panid
         elif type(panid) is bytes and len(addr) == 2:
             self.src_panid = struct.pack('<H',panid)
         else:
             raise ValueError
-            
+
     def set_dst_addr(self,addr):
+        """
+        Sets the destination address and mode based on the input type.
+        Accepts None, int (short), bytes (short/EUI64), or hex string (short/EUI64).
+        """
         if addr is None:
             self.dst_mode = WPANFrame.ADDR_NONE
             self.dst_addr = None
@@ -555,8 +724,9 @@ class WPANFrame:
                 raise ValueError
         else:
             raise ValueError
-            
+
     def set_dst_panid(self,panid):
+        """Sets the destination PAN ID. Accepts int or 2-byte bytes."""
         if type(panid) is int:
             self.dst_panid = panid
         elif type(panid) is bytes and len(addr) == 2:
@@ -565,6 +735,10 @@ class WPANFrame:
             raise ValueError
 
     def decode_ancl(self,ancl):
+        """
+        Decodes ancillary data (from recvmsg) to extract timestamp information.
+        Looks for SOL_SOCKET/SO_TIMESTAMPING messages and populates self.timestamp.
+        """
         for cmsg_level, cmsg_type, cmsg_data in ancl:
             #pr.debug('cmsg level={} type={} size={}\n'.format(cmsg_level,cmsg_type,len(cmsg_data)))
             if (cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SO_TIMESTAMPING):
@@ -573,6 +747,17 @@ class WPANFrame:
                 self.timestamp = tss
 
     def decode(self,data):
+        """
+        Decodes a raw byte string into the WPAN frame fields.
+        Parses Frame Control, Sequence Number, PAN IDs, and Addresses.
+        Handles PAN ID compression. Does not handle security headers.
+
+        Args:
+            data (bytes): The raw frame data.
+
+        Returns:
+            int: The length of the parsed header.
+        """
         ptr = 0
         self.frame = data
         self.frame_len = len(data)
@@ -625,8 +810,17 @@ class WPANFrame:
             raise NotImplementedError('decode WPAN security')
         self.header_len = ptr
         return ptr
-            
+
     def encode(self):
+        """
+        Encodes the WPAN frame fields into a byte string.
+        Constructs Frame Control based on flags and address modes.
+        Assigns the next DSN if not already set.
+        Handles PAN ID compression. Does not handle security headers.
+
+        Returns:
+            bytes: The encoded frame header. Payload must be appended separately.
+        """
         if self.frame_control is None:
             fc = self.frame_type & 0x07
             if self.security:
@@ -665,6 +859,7 @@ class WPANFrame:
         return data
 
     def __str__(self):
+        """Returns a string representation of the WPAN frame."""
         if WPANFrame.verbosity == 0:
             ret = 'WPAN Frame'
             ret += ' size:{}'.format(self.frame_len)
@@ -695,9 +890,9 @@ class WPANFrame:
 
 
 
-##
-## Tail data format
-##
+# ---------------------------------------------------------------------------
+# Tail Protocol Frame Format Handling (extends WPANFrame)
+# ---------------------------------------------------------------------------
 
 def int8(x):
     x = int(x) & 0xff
@@ -711,28 +906,47 @@ def int16(x):
         x -= 65536
     return x
 
-
 class TailFrame(WPANFrame):
+    """
+    Represents and handles encoding/decoding of Tail-specific protocol frames,
+    which are built on top of the basic WPAN frame structure.
+    Defines different frame types (Blink, Beacon, Ranging, Config) and
+    Information Elements (IEs).
+    """
+    # Tail Protocol Magic Numbers
+    PROTO_1 = 0x37 # Original Tail protocol identifier
+    PROTO_2 = 0x38 # Encrypted Tail protocol identifier (payload opaque here)
 
-    PROTO_1 = 0x37
-    PROTO_2 = 0x38
-
+    # Information Element (IE) Keys (ID -> Human-readable name)
     IE_KEYS =  {
         0x00 : 'Batt',
         0x01 : 'Vreg',
         0x02 : 'Temp',
         0x40 : 'Vbatt',
         0x80 : 'Blinks',
-        0xff : 'Debug',
+        0xff : 'Debug', # Debug information
     }
 
+    # Information Element (IE) Value Converters (ID -> lambda function)
+    # These convert raw IE byte values into meaningful units.
     IE_CONV =  {
         0x01 : lambda x: round(int8(x)/173+3.300, 3),
         0x02 : lambda x: round(int8(x)/1.14+23.0, 2),
-        0x40 : lambda x: round(x*5/32768, 3),
+        0x40 : lambda x: round(x*5/32768, 3), # Vbatt (likely raw ADC to Volts)
     }
 
     def __init__(self, data=None, ancl=None, protocol=0):
+        """
+        Initializes a TailFrame instance.
+
+        Args:
+            data (bytes, optional): Raw frame data to decode immediately. Defaults to None.
+            ancl (list, optional): Ancillary data (e.g., from recvmsg) containing
+                                   timestamp information. Defaults to None.
+            protocol (int, optional): Default Tail protocol version if creating a new frame.
+                                      Defaults to 0 (meaning it will be determined during decode
+                                      or set before encode).
+        """
         WPANFrame.__init__(self)
         self.tail_protocol  = protocol
         self.tail_payload   = None
@@ -761,16 +975,29 @@ class TailFrame(WPANFrame):
             self.decode(data)
         if ancl is not None:
             self.decode_ancl(ancl)
-            
+
+    @staticmethod
     def tsdecode(data):
+        """Decodes a 5-byte Tail timestamp into an integer (likely DW1000 units)."""
         times = struct.unpack_from('<Q', data.ljust(8, b'\0'))[0]
         return times
 
+    @staticmethod
     def tsencode(times):
+        """Encodes an integer timestamp into the 5-byte Tail format."""
         data = struct.pack('<Q',times)[0:5]
         return data
 
     def decode(self,data):
+        """
+        Decodes the Tail-specific payload portion of a WPAN frame.
+        This method assumes WPANFrame.decode() has already been called.
+        It parses the Tail protocol magic number and then dispatches
+        to specific parsing logic based on the Tail frame type and subtype.
+
+        Args:
+            data (bytes): The full frame data (including WPAN header).
+        """
         ptr = WPANFrame.decode(self,data)
         (magic,) = struct.unpack_from('<B',data,ptr)
         ptr += 1
@@ -995,8 +1222,17 @@ class TailFrame(WPANFrame):
         else:
             self.tail_protocol = 0
             self.tail_payload = data[ptr-1:]
-            
+
     def encode(self):
+        """
+        Encodes the Tail-specific payload and appends it to the WPAN header.
+        Calls WPANFrame.encode() first, then adds the Tail magic number
+        and payload based on the frame type and subtype attributes set
+        on the instance.
+
+        Returns:
+            bytes: The fully encoded Tail frame (WPAN header + Tail payload).
+        """
         data = WPANFrame.encode(self)
         if self.tail_protocol == 1:
             data += struct.pack('<B',TailFrame.PROTO_1)
@@ -1163,8 +1399,9 @@ class TailFrame(WPANFrame):
         self.frame_len = len(data)
         self.frame_data = data
         return data
-        
+
     def __str__(self):
+        """Returns a string representation of the Tail frame (includes WPAN info)."""
         str = WPANFrame.__str__(self)
         if WPANFrame.verbosity == 0:
             str += ' TAIL'
@@ -1298,8 +1535,13 @@ class TailFrame(WPANFrame):
         return str
 
     
-## Missing values in socket
-    
+# ---------------------------------------------------------------------------
+# Define Missing Socket Constants (for compatibility)
+# ---------------------------------------------------------------------------
+# This loop defines constants related to IEEE 802.15.4 sockets and timestamping
+# if they are not already present in the standard `socket` module. This ensures
+# the script works across different Python versions or environments where these
+# might not be standard.
 for name,value in (
         ('PROTO_IEEE802154', 0xf600),
         ('SO_TIMESTAMPING', 37),
@@ -1312,5 +1554,3 @@ for name,value in (
         ('SOF_TIMESTAMPING_RAW_HARDWARE', (1<<6))):
     if not hasattr(socket, name):
         setattr(socket, name, value)
-
-
