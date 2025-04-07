@@ -1,22 +1,32 @@
 # -*- python -*-
 #
-# Tail configuration file
+# config.py - Configuration and Constants for Tail RTLS
 #
+# This file defines various constants, calibration data (splines, tables),
+# and default/device-specific configurations used by the RTLS scripts.
+# Note: This appears to be mostly hardcoded values rather than a dynamic config loader.
+#
+# --- Network ---
+RPC_PORT = 61666 # Default RPC Port (Note: Different from calib/calibrate.py default)
 
-RPC_PORT = 61666
+# --- Physical Constants ---
+C_ABS = 299792458 # Speed of light in vacuum (m/s)
+C_AIR = 299705000 # Approx. speed of light in air (m/s)
 
-C_ABS = 299792458
-C_AIR = 299705000
+# --- DW1000 Constants ---
+DW1000_CLOCK_GHZ = 63.8976 # DW1000 clock frequency (GHz)
+DW1000_CLOCK_HZ  = DW1000_CLOCK_GHZ * 1E9 # DW1000 clock frequency (Hz)
 
-DW1000_CLOCK_GHZ = 63.8976
-DW1000_CLOCK_HZ  = DW1000_CLOCK_GHZ * 1E9
+# Default Antenna Delays (likely superseded by DW1000_DEVICE_CALIB)
+DW1000_64PRF_ANTD_NS = 514.4620 # Typical delay (ns) for 64 MHz PRF
+DW1000_16PRF_ANTD_NS = 513.9067 # Typical delay (ns) for 16 MHz PRF
+DW1000_64PRF_ANTD_DEFAULT = int(DW1000_64PRF_ANTD_NS * DW1000_CLOCK_GHZ / 2) # Default delay (ticks) for 64 MHz PRF
+DW1000_16PRF_ANTD_DEFAULT = int(DW1000_16PRF_ANTD_NS * DW1000_CLOCK_GHZ / 2) # Default delay (ticks) for 16 MHz PRF
 
-DW1000_64PRF_ANTD_NS = 514.4620
-DW1000_16PRF_ANTD_NS = 513.9067
+# --- Calibration Data ---
 
-DW1000_64PRF_ANTD_DEFAULT = int(DW1000_64PRF_ANTD_NS * DW1000_CLOCK_GHZ / 2)
-DW1000_16PRF_ANTD_DEFAULT = int(DW1000_16PRF_ANTD_NS * DW1000_CLOCK_GHZ / 2)
-
+# DW1000 RX Power Table (Purpose unclear - mapping ADC values? Deprecated?)
+# Format: Tuple of tuples, possibly (Input_Value, Ch1_Val, Ch2_Val, Ch3_Val) ?
 DW1000_RX_POWER_TABLE = (
     (0, 0, 0, 0),
     (25, 25, 25, 25),
@@ -61,6 +71,9 @@ DW1000_RX_POWER_TABLE = (
     (1585, 944, 1034, 1140),
 )
 
+# Compensation Splines (Similar/identical to those in dwarf.py and calib/calibrate.py)
+# Used to correct range measurements based on received signal power (dBm).
+# Structure: {bandwidth_MHz: {PRF_MHz: ( ((dBm_min, dBm_max), (coeff_a, coeff_b, coeff_c)), ... )}}
 DW1000_COMP_SPLINES = {
     500: {
         16: (
@@ -97,7 +110,9 @@ DW1000_COMP_SPLINES = {
     },
 }
 
+# --- Configuration Defaults & Device Specifics ---
 
+# List of standard DW1000 attributes used for configuration/status display
 DW1000_ATTRS = (
     'channel',
     'prf',
@@ -113,6 +128,7 @@ DW1000_ATTRS = (
     'noise_threshold',
 )
 
+# List of attributes available within the detailed Timestamp Info (TSInfo) structure
 DW1000_TSINFO_ATTRS = (
     'rawts',
     'lqi',
@@ -132,6 +148,7 @@ DW1000_TSINFO_ATTRS = (
     'volt',
 )
 
+# Default radio configuration parameters used if not overridden by device-specific config
 DW1000_DEFAULT_CONFIG = {
     'channel'	      : 7,
     'pcode'	      : 20,
@@ -144,9 +161,10 @@ DW1000_DEFAULT_CONFIG = {
     'antd'            : DW1000_64PRF_ANTD_DEFAULT,
     'snr_threshold'   : 0,
     'fpr_threshold'   : 0,
-    'noise_threshold' : 65535,
+    'noise_threshold' : 65535, # High threshold, likely disabling noise filtering
 }
 
+# Specific configuration profile presumably used during calibration procedures
 DW1000_CALIB_CONFIG = {
     'channel'	      : 7,
     'pcode'	      : 20,
@@ -160,6 +178,9 @@ DW1000_CALIB_CONFIG = {
     'noise_threshold' : 65535,
 }
 
+# Device-specific calibration values and metadata (coordinates, hostnames)
+# Keyed by device EUI-64 address (lowercase hex string).
+# This dictionary likely overrides defaults and potentially the ANTD constants above.
 DW1000_DEVICE_CALIB = {
     '70b3d5b1e0000001': {
         'xtalt'	   : 16,
@@ -383,4 +404,3 @@ DW1000_DEVICE_CALIB = {
         'antd'     : 0x404A,
     },
 }
-
