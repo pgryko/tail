@@ -1,6 +1,17 @@
 #!/usr/bin/python3
 #
-# Automatic DW1000 calibration
+# calibrate.py - Automatic DW1000 Calibration Script
+#
+# This script performs various calibration routines for DW1000 devices (Tags/Anchors)
+# configured in a setup file. It can calibrate:
+# - Crystal Oscillator Trim (XTALT)
+# - TX Power
+# - Antenna Delay (ANTD)
+#
+# It uses TWR (Two-Way Ranging) or similar blink-based measurements between a
+# Device Under Test (DUT) and multiple Reference (REF) devices with known positions.
+# Configuration is loaded from JSON files, and results can optionally be programmed
+# back to the device HAT EEPROM (using `inithat` via SSH).
 #
 
 import sys
@@ -18,20 +29,28 @@ from numpy import dot, sin, cos
 
 
 class cfg():
+    """
+    Configuration class holding global settings and parameters for the calibration script.
+    Defaults are set here and can be overridden by JSON config files and command-line arguments.
+    """
+    # --- Script Behavior ---
+    debug           = 0 # Debug level (higher for more output)
+    verbose         = 0 # Verbosity level (higher for more output)
 
-    debug           = 0
-    verbose         = 0
+    # --- File Paths ---
+    setup_json      = "setup.json" # Path to the device setup file (anchor positions, roles)
+    calib_json      = "calib.json" # Path to the calibration parameters file
 
-    setup_json      = "setup.json"
-    calib_json      = "calib.json"
+    # --- Actions ---
+    program         = False # Whether to program calibration results to the device HAT
 
-    program         = False
+    # --- Calibration Selection ---
+    calib_antd      = False # Perform Antenna Delay calibration
+    calib_xtalt     = False # Perform Crystal Trim calibration
+    calib_txpower   = False # Perform TX Power calibration
 
-    calib_antd      = False
-    calib_xtalt     = False
-    calib_txpower   = False
-    
-    dw1000_profile  = None
+    # --- DW1000 Radio Parameters (Defaults/Overrides) ---
+    dw1000_profile  = None # Radio profile (unused?)
     dw1000_channel  = 5
     dw1000_pcode    = 12
     dw1000_prf      = 64
@@ -39,39 +58,71 @@ class cfg():
     dw1000_txpsr    = 1024
     dw1000_smart    = 0
     dw1000_power    = '0x88888888'
-    dw1000_txlevel  = -12.3
+    dw1000_txlevel  = -12.3 # Target TX power level in dBm for TX power calibration
 
-    blink_count     = 100
-    blink_delay     = 0.050
-    blink_wait      = 0.500
-    blink_interval  = 0.250
+    # --- Measurement Parameters ---
+    blink_count     = 100   # Number of blinks/measurements per estimation step
+    blink_delay     = 0.050 # Delay (seconds) between blinks in some sequences (e.g., TWR)
+    blink_wait      = 0.500 # Timeout (seconds) waiting for blink responses from all devices
+    blink_interval  = 0.250 # Interval (seconds) between measurement cycles
 
-    ppm_offset      = 0.0
-    rpc_port        = 9812
+    # --- Calibration Parameters ---
+    ppm_offset      = 0.0   # Manual offset to apply to PPM calculations (for fine-tuning)
+    rpc_port        = 9812  # Default TCP port for RPC communication with devices
 
-    min_distance    = 2.00
+    # --- Geometric Parameters ---
+    min_distance    = 2.00  # Minimum distance (meters) between anchors used in calculations (avoids near-field issues?)
 
-    anchors         = []
+    # --- Device List ---
+    anchors         = []    # List to store anchor configuration dictionaries loaded from setup_json
 
+    @staticmethod
     def setarg(name, value):
+        """Helper to set a class attribute only if the provided value is not None."""
         if value is not None:
             setattr(cfg, name, value)
 
+# ---------------------------------------------------------------------------
+# Logging/Printing Helpers
+# ---------------------------------------------------------------------------
 
 def dprint(level, *args, **kwargs):
+    """Prints debug messages if the debug level is high enough."""
     if cfg.debug >= level:
         print(*args, file=sys.stderr, flush=True, **kwargs)
 
 def veprint(level, *args, **kwargs):
+    """Prints verbose messages if the verbosity level is high enough."""
     if cfg.verbose >= level:
         print(*args, file=sys.stderr, flush=True, **kwargs)
 
 def veprints(level, *args, **kwargs):
+    """Prints verbose messages without a newline if the verbosity level is high enough."""
     if cfg.verbose >= level:
         print(*args, file=sys.stderr, end='', flush=True, **kwargs)
 
+# ---------------------------------------------------------------------------
+# Calibration Estimation Functions
+# ---------------------------------------------------------------------------
 
 def estimate_xtal_ppm(blk, dut, refs):
+    """
+    Estimates the crystal frequency error (PPM) of a DUT relative to reference anchors.
+    Performs multiple two-way blink sequences between the DUT and each REF anchor.
+    Calculates the PPM error based on the difference in round-trip times.
+
+    Args:
+        blk (Blinks): The Blinks manager instance.
+        dut (DW1000): The Device Under Test.
+        refs (list): A list of reference DW1000 devices.
+
+    Returns:
+        tuple: (Sample Count, Success Rate, Avg PPM Error, Std Dev PPM Error,
+                Avg Temp, Std Dev Temp, Avg Volt, Std Dev Volt)
+
+    Raises:
+        RuntimeError: If not enough valid measurements are collected.
+    """
     
     Errs = [ ]
     Volts = [ ]
@@ -149,8 +200,21 @@ def estimate_xtal_ppm(blk, dut, refs):
     
     return (Tcnt,Rate,Eavg,Estd,Tavg,Tstd,Vavg,Vstd)
 
-
 def calibrate_xtalt(blk, dut, refs):
+    """
+    Performs automatic crystal trim calibration for a DUT.
+    Iteratively adjusts the DUT's XTALT register value and measures the resulting
+    PPM error using `estimate_xtal_ppm`. Uses a binary search-like approach
+    to find the trim value that minimizes the PPM error.
+
+    Args:
+        blk (Blinks): The Blinks manager instance.
+        dut (DW1000): The Device Under Test.
+        refs (list): A list of reference DW1000 devices.
+
+    Returns:
+        int: The best estimated XTALT trim value (0-31).
+    """
     
     veprint(1, 'Calibrating {} <{}> XTALT'.format(dut.name,dut.eui))
 
@@ -206,8 +270,26 @@ def calibrate_xtalt(blk, dut, refs):
     
     return best
 
-
 def estimate_txpower(blk, dut, refs):
+    """
+    Estimates the difference between the DUT's actual transmit power and a
+    target level (`cfg.dw1000_txlevel`), based on received power at reference anchors.
+    Sends blinks from the DUT and measures received power (CIR and First Path) at REFs.
+    Compares measured power to expected power based on distance and Friis model.
+
+    Args:
+        blk (Blinks): The Blinks manager instance.
+        dut (DW1000): The Device Under Test.
+        refs (list): A list of reference DW1000 devices.
+
+    Returns:
+        tuple: (Sample Count, Success Rate, Avg Rx Power Error (dBm), Std Dev Rx Power Error,
+                Avg FP Power Error (dBm), Std Dev FP Power Error,
+                Avg Temp, Std Dev Temp, Avg Volt, Std Dev Volt)
+
+    Raises:
+        RuntimeError: If not enough valid measurements are collected.
+    """
 
     Power = [ ]
     Fpath = [ ]
@@ -280,8 +362,23 @@ def estimate_txpower(blk, dut, refs):
     
     return (Tcnt,Rate,Pavg,Pstd,Favg,Fstd,Tavg,Tstd,Vavg,Vstd)
 
-
 def calibrate_txpower(blk, dut, refs):
+    """
+    Performs automatic TX power calibration for a DUT.
+    Iteratively adjusts the fine-tuning bits of the DUT's TX power register
+    and measures the resulting receive power error using `estimate_txpower`.
+    Uses a binary search-like approach on the fine-tuning value to minimize
+    the average receive power error relative to the target level.
+    Note: Only adjusts the fine part, assumes coarse setting is adequate.
+
+    Args:
+        blk (Blinks): The Blinks manager instance.
+        dut (DW1000): The Device Under Test.
+        refs (list): A list of reference DW1000 devices.
+
+    Returns:
+        int: The best estimated TX power code (byte) combining coarse and fine settings.
+    """
 
     txpwr = DW1000.tx_power_reg_to_list(dut.get_dw1000_attr('tx_power'))
 
@@ -336,9 +433,28 @@ def calibrate_txpower(blk, dut, refs):
     dut.set_dw1000_attr('tx_power', DW1000.tx_power_list_to_code(txpwr))
 
     return DW1000.tx_power_list_to_code(txpwr)
-    
 
 def trcalc(blk, idx, dut, dtx, drx):
+    """
+    Calculates Time-of-Flight (ToF) and ranging error using a three-blink sequence
+    (likely Symmetric Double-Sided Two-Way Ranging - SDS-TWR, or similar).
+    Requires timestamps from three blinks (dtx->dut, dut->drx, dtx->drx).
+
+    Args:
+        blk (Blinks): The Blinks manager instance.
+        idx (tuple): Tuple containing the beacon IDs (bids) of the three blinks (i1, i2, i3).
+        dut (DW1000): The Device Under Test.
+        dtx (DW1000): The transmitting reference anchor.
+        drx (DW1000): The receiving reference anchor.
+
+    Returns:
+        float: The calculated ranging error (measured ToF distance - geometric distance).
+
+    Raises:
+        KeyError: If blink data for a required ID/anchor is missing.
+        ValueError: If the calculated error is outside reasonable bounds (-10m to +10m).
+        ZeroDivisionError: If intermediate calculations result in division by zero.
+    """
 
     T1 = blk.get_rawts(idx[0], drx)
     T2 = blk.get_rawts(idx[0], dut)
@@ -372,8 +488,25 @@ def trcalc(blk, idx, dut, dtx, drx):
     
     return Err
 
-
 def calibrate_antd(blk, dut, refs):
+    """
+    Performs automatic Antenna Delay calibration for a DUT.
+    Iteratively adjusts the DUT's ANTD register value. For each value, it performs
+    multiple three-blink ranging measurements (`trcalc`) between the DUT and pairs
+    of reference anchors. It calculates the average ranging error and adjusts the
+    ANTD value to minimize this error.
+
+    Args:
+        blk (Blinks): The Blinks manager instance.
+        dut (DW1000): The Device Under Test.
+        refs (list): A list of reference DW1000 devices.
+
+    Returns:
+        int: The best estimated ANTD value.
+
+    Raises:
+        RuntimeError: If not enough valid measurements are collected.
+    """
 
     group = [dut,] + refs
 
@@ -455,8 +588,22 @@ def calibrate_antd(blk, dut, refs):
     
     return current
 
+# ---------------------------------------------------------------------------
+# Device Programming & Setup
+# ---------------------------------------------------------------------------
 
 def program_dw1000(dut):
+    """
+    Programs the calibrated values (XTALT, TXPWR, ANTD) to the DUT's HAT EEPROM
+    by executing the 'inithat' command on the remote device via SSH.
+
+    Args:
+        dut (DW1000): The Device Under Test, assumed to have calibrated values
+                      stored in dut.xtalt, dut.txpwr, dut.antd attributes.
+
+    Returns:
+        int: The return code of the SSH command.
+    """
 
     cmd = 'inithat'
     if dut.xtalt:
@@ -472,8 +619,28 @@ def program_dw1000(dut):
 
     return ssh.returncode
 
-
 def create_dw1000(rpc, name=None, host=None, port=None, coord=None, offset=None, rotation=None, role=None, group=None):
+    """
+    Creates, configures, and connects to a DW1000 device instance.
+    Applies coordinate offsets and rotations. Sets default radio parameters.
+
+    Args:
+        rpc (RPC): The RPC instance.
+        name (str, optional): Device name. Defaults to hostname part.
+        host (str, optional): Device hostname/IP. Required.
+        port (int, optional): RPC port. Defaults to cfg.rpc_port.
+        coord (list, optional): Base coordinates [x, y, z]. Defaults to [0,0,0].
+        offset (list, optional): Offset from base coordinates [x, y, z]. Defaults to [0,0,0].
+        rotation (list, optional): Rotation around axes (degrees) [rx, ry, rz]. Defaults to [0,0,0].
+        role (str, optional): Device role ('DUT' or 'REF'). Defaults to 'DUT'.
+        group (int, optional): Device group number. Defaults to 0.
+
+    Returns:
+        DW1000: The created and connected DW1000 device object.
+
+    Raises:
+        RuntimeError: If connection to the device fails.
+    """
 
     if name is None:
         name = host.split('.')[0]
@@ -527,8 +694,12 @@ def create_dw1000(rpc, name=None, host=None, port=None, coord=None, offset=None,
     
     return adev
 
+# ---------------------------------------------------------------------------
+# Configuration Loading Helpers
+# ---------------------------------------------------------------------------
 
 def load_dict(input, output, prefix=''):
+    """Loads key-value pairs from a dictionary into attributes of an object/class."""
     for (key,value) in input.items():
         try:
             getattr(output, prefix + key)
@@ -537,13 +708,21 @@ def load_dict(input, output, prefix=''):
             eprint('Invalid setup {}: {}'.format(key,value))
 
 def load_list(input, output, prefix=''):
+    """Appends items from an input list to an output list."""
     for value in input:
         output.append(value)
 
+# ---------------------------------------------------------------------------
+# Main Execution
+# ---------------------------------------------------------------------------
 
 def main():
-
-    parser = argparse.ArgumentParser(description="DW1000 calibraturd")
+    """
+    Main function: Parses arguments, loads configuration, connects to devices,
+    runs selected calibration routines, and optionally programs results.
+    """
+    # --- Argument Parsing ---
+    parser = argparse.ArgumentParser(description="DW1000 Calibration Script")
 
     parser.add_argument('-v', '--verbose', action='count', default=0)
     parser.add_argument('-D', '--debug', action='count', default=0)
@@ -611,10 +790,7 @@ def main():
     cfg.setarg('rpc_port', args.port)
     cfg.setarg('ppm_offset', args.ppm_offset)
 
-
-    ##
-    ## Devices
-    ##
+    # --- Device Initialization ---
     
     rpc = RPC()
     
@@ -638,14 +814,12 @@ def main():
     if args.verbose > 1:
         DW1000.print_all_remote_attrs(devs,True)
 
+    # --- Calibration Execution ---
 
-    ##
-    ## Calibration
-    ##
-
-    blk = Blinks(rpc)
+    blk = Blinks(rpc) # Create Blinks manager to handle incoming messages
 
     try:
+        # Iterate through each Device Under Test (DUT)
         for dut in duts:
 
             if cfg.calib_xtalt:
@@ -664,20 +838,23 @@ def main():
             if dut.antd:
                 prints(f' ANTD:0x{dut.antd:04x}')
 
-            prints('\n')
+            prints('\n') # Newline after printing results for the DUT
 
+            # Program results to HAT EEPROM if requested
             if cfg.program:
                 eprint(f'Programming {dut.name}')
                 program_dw1000(dut)
 
-    except KeyboardInterrupt:
+    except KeyboardInterrupt: # Allow graceful exit on Ctrl+C
         eprint('\rStopping...')
-    except RuntimeError as err:
+    except RuntimeError as err: # Catch runtime errors during calibration
         errhandler('Runtime error', err)
 
-    blk.stop()
-    rpc.stop()
+    # --- Cleanup ---
+    veprint(1, "Stopping RPC...")
+    blk.stop() # Stop Blinks manager (currently no-op)
+    rpc.stop() # Stop RPC thread
 
 
-if __name__ == "__main__": main() 
-
+if __name__ == "__main__":
+    main()
